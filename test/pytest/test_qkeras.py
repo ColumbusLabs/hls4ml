@@ -762,6 +762,8 @@ def test_qgru(test_case_id, backend):
         ('QLSTM', 'Vivado'),
         ('QLSTM', 'Quartus'),
         ('QLSTM', 'Altera'),
+        ('QGRU', 'Vivado'),
+        ('QGRU', 'Quartus'),
     ],
 )
 def test_qrnn_weight_quantizers(test_case_id, layer, backend):
@@ -769,16 +771,21 @@ def test_qrnn_weight_quantizers(test_case_id, layer, backend):
     Test that the kernel, recurrent kernel and bias quantizers of QKeras recurrent layers are applied.
     """
     q = 'quantized_bits(8, 0, alpha=1)'
-    quantizers = dict(kernel_quantizer=q, recurrent_quantizer=q, bias_quantizer=q)
+    kwargs = dict(kernel_quantizer=q, recurrent_quantizer=q, bias_quantizer=q)
     if layer == 'QSimpleRNN':
-        rnn = QSimpleRNN(8, activation='relu', **quantizers)
+        rnn = QSimpleRNN(8, activation='relu', **kwargs)
+    elif layer == 'QLSTM':
+        rnn = QLSTM(8, activation='tanh', recurrent_activation='sigmoid', **kwargs)
     else:
-        rnn = QLSTM(8, activation='tanh', recurrent_activation='sigmoid', **quantizers)
+        rnn = QGRU(8, activation='tanh', recurrent_activation='sigmoid', reset_after=True, **kwargs)
 
     keras.utils.set_random_seed(0)
     x_in = Input((6, 4))
     model = Model(x_in, rnn(x_in))
-    X = np.round(np.random.default_rng(0).uniform(-0.5, 0.5, (50, 6, 4)) * 2**7) * 2**-7
+    rng = np.random.default_rng(0)
+    kernel, recurrent_kernel, bias = rnn.get_weights()
+    rnn.set_weights([kernel, recurrent_kernel, rng.uniform(-0.5, 0.5, bias.shape)])
+    X = np.round(rng.uniform(-0.5, 0.5, (50, 6, 4)) * 2**7) * 2**-7
 
     config = hls4ml.utils.config_from_keras_model(
         model, granularity='name', backend=backend, default_precision='ap_fixed<24,10>'
@@ -787,8 +794,14 @@ def test_qrnn_weight_quantizers(test_case_id, layer, backend):
     hls_model = hls4ml.converters.convert_from_keras_model(model, hls_config=config, output_dir=output_dir, backend=backend)
 
     kernel, recurrent_kernel, bias = rnn.get_weights()
+    weights = [('weight', kernel), ('recurrent_weight', recurrent_kernel)]
+    if layer == 'QGRU':
+        # With reset_after=True, Keras stores the input and recurrent biases in one array
+        weights += [('bias', bias[0]), ('recurrent_bias', bias[1])]
+    else:
+        weights += [('bias', bias)]
     hls_layer = hls_model.graph[rnn.name]
-    for name, w in (('weight', kernel), ('recurrent_weight', recurrent_kernel), ('bias', bias)):
+    for name, w in weights:
         # Some backends store the weights transposed, so compare the sorted values
         expected = np.sort(np.asarray(quantized_bits(8, 0, alpha=1)(w)), axis=None)
         np.testing.assert_array_equal(np.sort(hls_layer.get_weights(name).data, axis=None), expected)
