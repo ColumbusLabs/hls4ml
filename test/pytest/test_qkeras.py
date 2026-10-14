@@ -1,6 +1,7 @@
 import warnings
 from pathlib import Path
 
+import keras
 import numpy as np
 import pytest
 from keras.layers import BatchNormalization, Input
@@ -751,6 +752,52 @@ def test_qgru(test_case_id, backend):
     y_hls4ml = hls_model.predict(X)
 
     np.testing.assert_allclose(y_qkeras, y_hls4ml.reshape(y_qkeras.shape), atol=0.1)
+
+
+@pytest.mark.parametrize(
+    'layer, backend',
+    [
+        ('QSimpleRNN', 'Quartus'),
+        ('QSimpleRNN', 'Altera'),
+        ('QLSTM', 'Vivado'),
+        ('QLSTM', 'Quartus'),
+        ('QLSTM', 'Altera'),
+    ],
+)
+def test_qrnn_weight_quantizers(test_case_id, layer, backend):
+    """
+    Test that the kernel, recurrent kernel and bias quantizers of QKeras recurrent layers are applied.
+    """
+    q = 'quantized_bits(8, 0, alpha=1)'
+    quantizers = dict(kernel_quantizer=q, recurrent_quantizer=q, bias_quantizer=q)
+    if layer == 'QSimpleRNN':
+        rnn = QSimpleRNN(8, activation='relu', **quantizers)
+    else:
+        rnn = QLSTM(8, activation='tanh', recurrent_activation='sigmoid', **quantizers)
+
+    keras.utils.set_random_seed(0)
+    x_in = Input((6, 4))
+    model = Model(x_in, rnn(x_in))
+    X = np.round(np.random.default_rng(0).uniform(-0.5, 0.5, (50, 6, 4)) * 2**7) * 2**-7
+
+    config = hls4ml.utils.config_from_keras_model(
+        model, granularity='name', backend=backend, default_precision='ap_fixed<24,10>'
+    )
+    output_dir = str(test_root_path / test_case_id)
+    hls_model = hls4ml.converters.convert_from_keras_model(model, hls_config=config, output_dir=output_dir, backend=backend)
+
+    kernel, recurrent_kernel, bias = rnn.get_weights()
+    hls_layer = hls_model.graph[rnn.name]
+    for name, w in (('weight', kernel), ('recurrent_weight', recurrent_kernel), ('bias', bias)):
+        # Some backends store the weights transposed, so compare the sorted values
+        expected = np.sort(np.asarray(quantized_bits(8, 0, alpha=1)(w)), axis=None)
+        np.testing.assert_array_equal(np.sort(hls_layer.get_weights(name).data, axis=None), expected)
+
+    hls_model.compile()
+    y_qkeras = model.predict(X)
+    y_hls4ml = hls_model.predict(X)
+
+    np.testing.assert_allclose(y_qkeras, y_hls4ml.reshape(y_qkeras.shape), atol=0.02)
 
 
 @pytest.mark.parametrize('backend', ['Vivado', 'Vitis'])
